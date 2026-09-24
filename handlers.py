@@ -82,7 +82,14 @@ _PERSONA_LEGACY_IDX = -1
 
 async def run_db(fn, *args, **kwargs):
     """Запускаем синхронную sqlite-операцию в фоне, не блокируя event loop."""
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    try:
+        to_thread = asyncio.to_thread
+    except AttributeError:  # Python 3.8: to_thread ещё нет
+        loop = asyncio.get_event_loop()
+        import functools
+        return await loop.run_in_executor(
+            None, functools.partial(fn, *args, **kwargs))
+    return await to_thread(fn, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
