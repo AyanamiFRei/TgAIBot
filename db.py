@@ -1,0 +1,241 @@
+"""Хранилище: история переписки и активный persona per user. sqlite3 stdlib.
+
+Соединение одно, открывается в startup бота. Запросы идут синхронно —
+оборачиваем вызовы в asyncio.to_thread, чтобы не блокировать event loop.
+"""
+from __future__ import annotations
+
+import sqlite3
+import time
+from dataclasses import dataclass
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id    INTEGER PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    role       TEXT    NOT NULL,   -- 'user' | 'assistant'
+    kind       TEXT    NOT NULL,   -- 'text' | 'image' | 'sticker'
+    content    TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_user_time
+    ON messages (user_id, id);
+
+CREATE TABLE IF NOT EXISTS personas (
+    user_id    INTEGER PRIMARY KEY,
+    name       TEXT    NOT NULL,
+    summary    TEXT    NOT NULL,
+    source_raw TEXT,
+    updated_at INTEGER NOT NULL
+);
+"""
+
+
+@dataclass
+class Persona:
+    name: str
+    summary: str
+
+
+def connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    # Разделяем одно соединение между event-loop (хендлеры) и фоновым proactive-циклом.
+    # Запросы идут через asyncio.to_thread, поэтому конкурентные writes возможны
+    # (хендлер пишет реплику, а proactive同期 пишет свой чанк). busy_timeout даёт
+    # sqlite до 5с подождать освобождения блокировки вместо моментального
+    # «database is locked», что нормально для низконагруженного личного бота.
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.executescript(SCHEMA)
+    conn.commit()
+    return conn
+
+
+def ensure_user(conn: sqlite3.Connection, user_id: int) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)",
+        (user_id, int(time.time())),
+    )
+    conn.commit()
+
+
+def is_dup_user_text(
+    conn: sqlite3.Connection,
+    user_id: int,
+    content: str,
+    window_s: int = 30,
+) -> bool:
+    """Был ли точно такой же текстовый ход от user_id за последние window_s секунд?
+
+    Telegram в режиме long-polling (особенно когда бот подолгу отвечает стримом)
+    иногда доносит одно и то же сообщение дважды — aiogram отдаёт его в хендлер
+    повторно. Без дедупа дубль попадает в БД и в будущий контекст модели: она видит
+    «одно и то же сообщение шесть раз подряд» и закономерно жалуется
+    «хватит уже repeating одно и то же». Эту же проверку ставим перед записью/стримом
+    в handle_text/_media_turn — дубль не пишем и не отвечаем.
+
+    Окно 30с: больше — рискуем убить быструю осмысленную двойную отправку («да» «да»
+    подряд реально бывает), меньше — не покроем запоздалый retry. 30с — баланс.
+    """
+    cur = conn.execute(
+        "SELECT 1 FROM messages "
+        "WHERE user_id = ? AND role = 'user' AND content = ? "
+        "AND created_at >= ? LIMIT 1",
+        (user_id, content, int(time.time()) - window_s),
+    )
+    return cur.fetchone() is not None
+
+
+def add_message(
+    conn: sqlite3.Connection,
+    user_id: int,
+    role: str,
+    kind: str,
+    content: str,
+) -> None:
+    conn.execute(
+        "INSERT INTO messages (user_id, role, kind, content, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (user_id, role, kind, content, int(time.time())),
+    )
+    conn.commit()
+
+
+def get_recent(
+    conn: sqlite3.Connection, user_id: int, limit: int
+) -> list[sqlite3.Row]:
+    cur = conn.execute(
+        "SELECT role, kind, content FROM messages "
+        "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    )
+    rows = cur.fetchall()
+    rows.reverse()  # хронологический порядок
+    return list(rows)
+
+
+def get_recent_budget(
+    conn: sqlite3.Connection,
+    user_id: int,
+    max_chars: int,
+    hard_limit: int = 400,
+) -> list[sqlite3.Row]:
+    """Последние реплики диалога в хронологическом порядке, в бюджете по длине.
+
+    glm-5.2 держит контекст до 1M токенов, но гонять туда всю историю на каждый
+    запрос бессмысленно — обработка промпта линейна по длине, длинный контекст
+    только тормозит генерацию. Для живого чата достаточно осмысленного хвоста
+    ~3-5k токенов (≈10-16k символов). Поэтому ограничиваем суммарной длиной,
+    а не числом сообщений: короткая переписка влезет целиком, длинная обрежется
+    до хвоста. hard_limit — страховочный потолок числа строк (от мега-реплик).
+    """
+    cur = conn.execute(
+        "SELECT role, kind, content FROM messages "
+        "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+        (user_id, hard_limit),
+    )
+    rows = list(cur.fetchall())
+    rows.reverse()
+
+    total = 0
+    kept_start = 0
+    for i in range(len(rows) - 1, -1, -1):
+        content = rows[i]["content"]
+        total += len(content) if content else 0
+        if total > max_chars:
+            kept_start = i + 1
+            break
+    return rows[kept_start:]
+
+
+def get_persona(conn: sqlite3.Connection, user_id: int) -> Persona | None:
+    cur = conn.execute(
+        "SELECT name, summary FROM personas WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return Persona(name=row["name"], summary=row["summary"])
+
+
+def set_persona(
+    conn: sqlite3.Connection,
+    user_id: int,
+    name: str,
+    summary: str,
+    source_raw: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT INTO personas (user_id, name, summary, source_raw, updated_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "  name = excluded.name, "
+        "  summary = excluded.summary, "
+        "  source_raw = excluded.source_raw, "
+        "  updated_at = excluded.updated_at",
+        (user_id, name, summary, source_raw, int(time.time())),
+    )
+    conn.commit()
+
+
+def delete_persona(conn: sqlite3.Connection, user_id: int) -> None:
+    conn.execute("DELETE FROM personas WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+
+# --- Proactive messaging: помощь фоновому циклу «бот иногда пишет первым» ---
+
+def last_activity_per_user(conn: sqlite3.Connection) -> dict[int, int]:
+    """{user_id: created_at самой свежей реплики} для всех юзеров с сообщениями.
+    GROUP BY user_id — full table scan, но для персонального бота (десятки-сотни
+    юзеров) дёшево; джоинить с users не нужно — нас интересуют лишь те, у кого
+    уже есть хоть какая-то переписка. Юзеры без сообщений сюда не попадают."""
+    cur = conn.execute(
+        "SELECT user_id, MAX(created_at) AS last_ts FROM messages GROUP BY user_id"
+    )
+    return {int(r["user_id"]): int(r["last_ts"]) for r in cur.fetchall()}
+
+
+def last_row(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    """Самая свежая реплика юзера (по id DESC). Ключи: role, kind, content, created_at.
+    Нужна чтобы понять, был ли последний ход от юзера (motive 'silence') или от
+    бота (motive 'continuation')."""
+    cur = conn.execute(
+        "SELECT role, kind, content, created_at FROM messages "
+        "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    return cur.fetchone()
+
+
+def proactive_count_24h(conn: sqlite3.Connection, user_id: int) -> int:
+    """Сколько proactive-реплик бот УЖЕ прислал юзеру за rolling 24 часа.
+    created_at хранится в epoch-секундах UTC — часовой пояс не нужен."""
+    cur = conn.execute(
+        "SELECT COUNT(*) AS n FROM messages "
+        "WHERE user_id = ? AND role = 'assistant' AND kind = 'proactive' "
+        "AND created_at >= ?",
+        (user_id, int(time.time()) - 86400),
+    )
+    return int(cur.fetchone()["n"])
+
+
+def last_proactive_ts(conn: sqlite3.Connection, user_id: int) -> int | None:
+    """created_at последней proactive-реплики бота этому юзеру, или None если их
+    ещё не было. Для per-user троттла proactive_min_gap_h между пинками."""
+    cur = conn.execute(
+        "SELECT created_at FROM messages "
+        "WHERE user_id = ? AND role = 'assistant' AND kind = 'proactive' "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    return int(row["created_at"]) if row else None
