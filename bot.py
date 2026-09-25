@@ -45,14 +45,15 @@ async def main() -> None:
         try:
             import sdnotify  # type: ignore[import-not-found]
             _sd = sdnotify.SystemdNotifier()
+            # WATCHDOG_USEC приходит из systemd в окружении процесса.
+            try:
+                wd_usec = int(os.getenv("WATCHDOG_USEC", "180000000"))
+            except ValueError:
+                wd_usec = 180000000
+            # пинг дважды за период watchdog'а
+            interval = max(wd_usec / 1e6 / 2, 5.0)
 
             async def _watchdog() -> None:
-                # WATCHDOG_USEC приходит из systemd в окружении процесса.
-                try:
-                    wd_usec = int(os.getenv("WATCHDOG_USEC", "180000000"))
-                except ValueError:
-                    wd_usec = 180000000
-                interval = max(wd_usec / 1e6 / 2, 5.0)  # пинг дважды за период
                 while True:
                     _sd.notify("WATCHDOG=1")
                     await asyncio.sleep(interval)
