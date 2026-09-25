@@ -90,10 +90,15 @@ async def build_proactive_messages(
     motive: str,
     silence_hours: float,
 ) -> list[dict]:
-    """Аналог handlers._build_messages, но БЕЗ хвостового user-хода: system строит
-    build_system_proactive (он сам говорит «ты пишешь первым»), + та же история.
-    Никакого синтетического user-cue — система несёт ситуацию, первый токен
-    модели — сам poking."""
+    """Аналог handlers._build_messages, но хвост — синтетический user-ход с
+    инструкцией «ты пишешь первым» (_proactive_user_turn), а НЕ в system: system
+    строит build_system_proactive — тот же build_system, что и в обычном диалоге.
+    Никакого другого синтетического user-cue — инструкция несёт только хвост,
+    первый токен модели — сам poking.
+
+    Кеш: system здесь байт-идентичен обычному диалоговому, поэтому префикс
+    [system + история] совпадает между обычными и proactive-запросами — общий
+    кеш промпта (раньше proactive-блок в system сбрасывал его на каждом пинке)."""
     history = await run_db(
         db.get_recent_budget, conn, user_id, cfg.history_chars, cfg.history_window,
     )
@@ -104,7 +109,7 @@ async def build_proactive_messages(
         {
             "role": "system",
             "content": prompts.build_system_proactive(
-                persona.summary if persona else None, sticker_vibes, silence_hours, motive,
+                persona.summary if persona else None, sticker_vibes,
             ),
         }
     ]
@@ -115,7 +120,10 @@ async def build_proactive_messages(
             messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": "assistant", "content": content})
-    # НЕТ trailing user-сообщения — модель должна начать сама.
+    # Хвост — синтетический user-ход с инструкцией (в БД не пишется, юзеру не
+    # показывается). OpenAI-совместимый протокол требует user последним ходом —
+    # «пустого» хода у него нет, поэтому инструкция кладётся туда.
+    messages.append({"role": "user", "content": prompts._proactive_user_turn(silence_hours, motive)})
     return messages
 
 

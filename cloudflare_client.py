@@ -30,6 +30,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _log_cache_usage(data: dict) -> None:
+    """Логируем cached_tokens из usage — видно, попадает ли префикс промпта в кеш.
+    OpenAI-совместимые API отдают usage.prompt_tokens_details.cached_tokens;
+    если поля нет (провайдер не поддерживает/не отдаёт) — тихо выходим.
+    DEBUG-уровень, чтобы не спамить в обычном логе."""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else usage.get("cached_tokens")
+    if isinstance(cached, int) and cached > 0:
+        logger.debug(
+            "prompt cache: %d/%s токенов из кеша",
+            cached, usage.get("prompt_tokens", "?"),
+        )
+
+
 class CloudflareError(Exception):
     """AI-провайдер (Cloudflare Workers AI / Mistral) вернул ошибку."""
 
@@ -185,6 +202,8 @@ class CloudflareClient:
                             data = json.loads(data_text)
                         except json.JSONDecodeError:
                             continue
+                        # usage (в т.ч. cached_tokens) приходит в последнем чанке SSE.
+                        _log_cache_usage(data)
                         choices = data.get("choices") or []
                         if not choices:
                             continue
@@ -222,6 +241,7 @@ class CloudflareClient:
             data = response.json()
         except Exception as exc:
             raise CloudflareError(f"не удалось разобрать ответ модели: {exc!s}") from exc
+        _log_cache_usage(data)
         choices = data.get("choices") or []
         if not choices:
             raise CloudflareError("модель вернула пустой ответ")
