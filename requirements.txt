@@ -4,3 +4,4 @@ aiofiles==24.1.0
 httpx==0.28.1
 pillow==11.3.0
 python-dotenv==1.2.1
+sdnotify==0.3.2

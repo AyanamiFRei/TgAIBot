@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import socket
 import sys
 
 from aiogram import Bot, Dispatcher
@@ -34,6 +36,34 @@ async def main() -> None:
         token=cfg.bot_token,
         default=DefaultBotProperties(parse_mode=None),  # plain текст, как живой человек
     )
+
+    # Watchdog: если event loop завис (polling молчит, запрос висит без ответа),
+    # systemd сам перезапустит сервис — процесс не должен висеть в epoll молча.
+    # WORKING watchdog: SD_NOTIFY=1 в .env (на VPS), локально выключено —
+    # sd_notify требует libsystemd, которого нет на Windows/локальном Python.
+    if os.getenv("SD_NOTIFY") == "1" and hasattr(socket, "AF_UNIX"):
+        try:
+            import sdnotify  # type: ignore[import-not-found]
+            _sd = sdnotify.SystemdNotifier()
+
+            async def _watchdog() -> None:
+                # WATCHDOG_USEC приходит из systemd в окружении процесса.
+                try:
+                    wd_usec = int(os.getenv("WATCHDOG_USEC", "180000000"))
+                except ValueError:
+                    wd_usec = 180000000
+                interval = max(wd_usec / 1e6 / 2, 5.0)  # пинг дважды за период
+                while True:
+                    _sd.notify("WATCHDOG=1")
+                    await asyncio.sleep(interval)
+
+            asyncio.create_task(_watchdog())
+            _sd.notify("READY=1")
+            logger.info("systemd watchdog включён (пинг каждые %.0f с)", interval)
+        except Exception:  # noqa: BLE001
+            logger.warning("sd_notify недоступен, watchdog выключен: %s", sys.exc_info()[1])
+    else:
+        logger.info("systemd watchdog выключен (SD_NOTIFY не задан)")
 
     conn = db.connect(cfg.db_full_path)
     # Текстовый провайдер выбирается в .env через AI_PROVIDER=cloudflare|mistral —

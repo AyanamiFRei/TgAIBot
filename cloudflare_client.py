@@ -107,12 +107,15 @@ class CloudflareClient:
                 )
             except httpx.HTTPError as exc:
                 last_exc = exc
-                logger.warning("Cloudflare transport error, attempt %d: %s", attempt + 1, exc)
+                logger.warning(
+                    "Cloudflare transport error, attempt %d: %s: %s",
+                    attempt + 1, type(exc).__name__, exc,
+                )
                 attempt += 1
                 if attempt < 5:
                     await asyncio.sleep(2.0 * (2**attempt))
                     continue
-                raise CloudflareError(f"не удалось связаться с моделью: {exc!s}") from exc
+                raise CloudflareError(f"не удалось связаться с моделью ({type(exc).__name__}): {exc!s}") from exc
 
             if response.status_code == 200:
                 return self._parse(response)
@@ -214,13 +217,14 @@ class CloudflareClient:
             except httpx.HTTPError as exc:
                 last_exc = exc
                 logger.warning(
-                    "Cloudflare stream transport error, attempt %d: %s", attempt + 1, exc
+                    "Cloudflare stream transport error, attempt %d: %s: %s",
+                    attempt + 1, type(exc).__name__, exc,
                 )
                 attempt += 1
                 if attempt < 5:
                     await asyncio.sleep(2.0 * (2**attempt))
                     continue
-                raise CloudflareError(f"не удалось связаться с моделью: {exc!s}") from exc
+                raise CloudflareError(f"не удалось связаться с моделью ({type(exc).__name__}): {exc!s}") from exc
 
         assert last_exc is not None
         raise last_exc
