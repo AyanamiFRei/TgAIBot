@@ -10,6 +10,10 @@
 API-ключ можно указать один или несколько через запятую — при 401/403/429
 клиент ротирует ключи (упёрлись в лимит одного — пробуем следующий).
 
+Помимо ротации ключей есть фолбэк-модель: если основная модель упёрлась в
+лимит/ошибку (429, 5xx, транспортные зависания), клиент переключается на
+резервную (например, glm-5.3-flash → glm-5.3, когда flash перегружен).
+
 Имя класса осталось историческим (CloudflareClient), чтобы не трогать сигнатуры
 по всему проекту (handlers.py, proactive.py и т.д. типизированы на него) — по
 сути это просто «generic OpenAI-compatible chat client».
@@ -52,12 +56,22 @@ class CloudflareError(Exception):
 
 
 class CloudflareClient:
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        fallback_model: str | None = None,
+    ) -> None:
         # API-ключей может быть несколько, через запятую: при 401/403/429 клиент
         # ротирует их — если один ключ упёрся в лимит или отозван, пробуем следующий.
         self._api_keys = [k.strip() for k in api_key.split(",") if k.strip()]
         self._key_idx = 0
         self._model = model
+        # Резервная модель: когда основная упёрлась в лимит/перегруз (429/5xx) или
+        # транспорт зависает, переключаемся на неё (None — фолбэка нет).
+        self._fallback_model = fallback_model
+        self._on_fallback = False
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             headers={
@@ -78,6 +92,20 @@ class CloudflareClient:
         self._key_idx += 1
         return True
 
+    @property
+    def _active_model(self) -> str:
+        """Текущая активная модель: основная или резервная (после фолбэка)."""
+        if self._on_fallback and self._fallback_model:
+            return self._fallback_model
+        return self._model
+
+    def _try_fallback(self) -> bool:
+        """Переключаемся на резервную модель. False — фолбэк-модели нет или уже на ней."""
+        if not self._fallback_model or self._on_fallback:
+            return False
+        self._on_fallback = True
+        return True
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -90,7 +118,7 @@ class CloudflareClient:
         model: str | None = None,
     ) -> str:
         payload = {
-            "model": model or self._model,
+            "model": model or self._active_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -99,6 +127,8 @@ class CloudflareClient:
         last_exc: Exception | None = None
         attempt = 0
         while attempt < 5:
+            # Модель берём на каждой попытке: фолбэк может сработать посреди цикла.
+            payload["model"] = model or self._active_model
             try:
                 response = await self._client.post(
                     "/chat/completions",
@@ -113,6 +143,13 @@ class CloudflareClient:
                 )
                 attempt += 1
                 if attempt < 5:
+                    # Залипание/обрыв транспорта — есть фолбэк-модель, пробуем её:
+                    # иногда перегружена именно основная, резервная отвечает.
+                    if self._try_fallback():
+                        logger.warning(
+                            "Cloudflare transport error: переключаюсь на резервную модель %s",
+                            self._fallback_model,
+                        )
                     await asyncio.sleep(2.0 * (2**attempt))
                     continue
                 raise CloudflareError(f"не удалось связаться с моделью ({type(exc).__name__}): {exc!s}") from exc
@@ -136,6 +173,15 @@ class CloudflareClient:
                 # На другой ключ не спим retry-after — у нового ключа свой лимит.
                 continue
 
+            # 429/5xx на всех ключах — пробуем резервную модель (если задана):
+            # например, flash перегружен → переключаемся на полную.
+            if response.status_code in (429, 500, 502, 503, 504) and self._try_fallback():
+                logger.warning(
+                    "Cloudflare %s: модель %s упёрлась в лимит/перегруз, переключаюсь на резервную %s",
+                    response.status_code, self._model, self._fallback_model,
+                )
+                continue
+
             if response.status_code in (429, 500, 502, 503, 504) and attempt < 4:
                 await asyncio.sleep(self._retry_after(response, attempt))
                 continue
@@ -155,7 +201,7 @@ class CloudflareClient:
         model: str | None = None,
     ) -> AsyncIterator[str]:
         payload = {
-            "model": model or self._model,
+            "model": model or self._active_model,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -164,6 +210,8 @@ class CloudflareClient:
         last_exc: Exception | None = None
         attempt = 0
         while attempt < 5:
+            # Модель берём на каждой попытке: фолбэк может сработать посреди цикла.
+            payload["model"] = model or self._active_model
             try:
                 async with self._client.stream(
                     "POST", "/chat/completions", json=payload,
@@ -184,6 +232,15 @@ class CloudflareClient:
                             logger.warning(
                                 "Cloudflare stream %s: ключ упёрся в лимит/отказ, переключаюсь на следующий (из %d)",
                                 response.status_code, len(self._api_keys),
+                            )
+                            continue
+
+                        # 429/5xx на всех ключах — пробуем резервную модель (если задана):
+                        # например, flash перегружен → переключаемся на полную.
+                        if response.status_code in (429, 500, 502, 503, 504) and self._try_fallback():
+                            logger.warning(
+                                "Cloudflare stream %s: модель %s упёрлась в лимит/перегруз, переключаюсь на резервную %s",
+                                response.status_code, self._model, self._fallback_model,
                             )
                             continue
 
@@ -222,6 +279,13 @@ class CloudflareClient:
                 )
                 attempt += 1
                 if attempt < 5:
+                    # Залипание/обрыв транспорта — есть фолбэк-модель, пробуем её:
+                    # иногда перегружена именно основная, резервная отвечает.
+                    if self._try_fallback():
+                        logger.warning(
+                            "Cloudflare stream transport error: переключаюсь на резервную модель %s",
+                            self._fallback_model,
+                        )
                     await asyncio.sleep(2.0 * (2**attempt))
                     continue
                 raise CloudflareError(f"не удалось связаться с моделью ({type(exc).__name__}): {exc!s}") from exc
@@ -278,6 +342,7 @@ def build_ai_client(cfg: "Config", provider: str | None = None) -> CloudflareCli
             base_url=cfg.nvidia_base_url,
             api_key=cfg.nvidia_api_key,
             model=cfg.nvidia_model,
+            fallback_model=cfg.nvidia_fallback_model,
         )
     logger.info("AI-клиент: cloudflare (модель %s)", cfg.cloudflare_model)
     return CloudflareClient(

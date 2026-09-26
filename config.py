@@ -33,6 +33,9 @@ class Config:
     nvidia_api_key: str
     nvidia_base_url: str
     nvidia_model: str
+    # Резервная NVIDIA-модель: когда основная упёрлась в лимит/перегруз (429/5xx),
+    # клиент автоматически переключается на неё. Пусто — фолбэка нет.
+    nvidia_fallback_model: str
     history_window: int
     history_chars: int
     max_tokens: int
@@ -164,6 +167,8 @@ def get_config() -> Config:
         # эндпоинт, поэтому обслуживается тем же CloudflareClient. Vision встроен
         # в модель (мультимодальная) — фото/стикеры уходят в тот же клиент.
         nvidia_model=(os.getenv("NVIDIA_MODEL") or "z-ai/glm-5.3-flash"),
+        # Резервная модель для фолбэка при 429/5xx (NVIDIA_FALLBACK_MODEL в .env).
+        nvidia_fallback_model=(os.getenv("NVIDIA_FALLBACK_MODEL") or "").strip(),
         # Лёгкая vision-модель: только описывает фото/стикер в 1-2 предложения,
         # описание потом подмешивается в основной диалог как текст.
         history_window=_get_int("HISTORY_WINDOW", 400),
