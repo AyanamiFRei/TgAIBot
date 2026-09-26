@@ -184,6 +184,7 @@ async def _run_webhook(bot: Bot, dp: Dispatcher, cfg: Config) -> None:
     webhook_url = cfg.webhook_public_url or (
         f"https://{cfg.webhook_host_ip}:{cfg.webhook_port}{cfg.webhook_path}"
     )
+    from aiogram.types import FSInputFile
     cert_file = FSInputFile(cfg.webhook_cert_path) if cfg.webhook_cert_path else None
     await bot.set_webhook(
         webhook_url,
