@@ -155,7 +155,23 @@ class CloudflareClient:
                 raise CloudflareError(f"не удалось связаться с моделью ({type(exc).__name__}): {exc!s}") from exc
 
             if response.status_code == 200:
-                return self._parse(response)
+                parsed = self._parse(response)
+                # Пустой контент при 200 — у reasoning-моделей размышления съедают
+                # весь max_tokens. Ретраим (фолбэк чаще отвечает без размышлений),
+                # иначе бот молчит при «успешном» ответе.
+                if not parsed and attempt < 4:
+                    logger.warning(
+                        "Cloudflare: пустой ответ от %s (attempt %d)", self._active_model, attempt + 1,
+                    )
+                    if self._try_fallback():
+                        logger.warning(
+                            "Cloudflare: пустой ответ, переключаюсь на резервную модель %s",
+                            self._fallback_model,
+                        )
+                    attempt += 1
+                    await asyncio.sleep(1.0)
+                    continue
+                return parsed
 
             body = response.text[:500]
             logger.error("Cloudflare %s: %s", response.status_code, body)
@@ -251,6 +267,7 @@ class CloudflareClient:
                             raise CloudflareError("лимит модели временно исчерпан")
                         raise last_exc
 
+                    got_content = False
                     async for line in response.aiter_lines():
                         line = line.strip()
                         if not line or not line.startswith("data:"):
@@ -269,7 +286,25 @@ class CloudflareClient:
                             continue
                         content = (choices[0].get("delta") or {}).get("content")
                         if isinstance(content, str) and content:
+                            got_content = True
                             yield content
+                    # Стрим завершился, но контента не было вообще: у reasoning-моделей
+                    # (glm-5.3-flash) размышления съедают весь бюджет max_tokens —
+                    # на видимый ответ не остаётся ничего. Это пустой ответ — ретраим
+                    # (фолбэк-модель часто отвечает без размышлений в такой ситуации),
+                    # иначе бот молчит, хотя всё отработало «успешно».
+                    if not got_content:
+                        last_exc = CloudflareError("модель вернула пустой ответ (весь бюджет съели размышления)")
+                        attempt += 1
+                        if self._try_fallback():
+                            logger.warning(
+                                "Cloudflare stream: пустой ответ от %s, переключаюсь на резервную %s",
+                                self._model, self._fallback_model,
+                            )
+                        if attempt >= 5:
+                            raise last_exc
+                        await asyncio.sleep(1.0)
+                        continue
                     return
             except httpx.HTTPError as exc:
                 last_exc = exc
