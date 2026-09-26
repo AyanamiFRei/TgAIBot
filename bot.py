@@ -110,7 +110,10 @@ async def main() -> None:
         proactive.proactive_loop(bot, conn, ai, cfg, sticker_store)
     )
     try:
-        await dp.start_polling(bot)
+        if cfg.webhook_mode:
+            await _run_webhook(bot, dp, cfg)
+        else:
+            await dp.start_polling(bot)
     finally:
         proactive_task.cancel()
         try:
@@ -122,6 +125,95 @@ async def main() -> None:
             await vision_ai.aclose()
         conn.close()
         logger.info("Бот остановлен.")
+
+
+async def _run_webhook(bot: Bot, dp: Dispatcher, cfg: Config) -> None:
+    """Приём апдейтов вебхуком вместо polling.
+
+    Зачем: long-polling в aiogram 3.13 трижды зависал намертво (эпизоды 25-26.09:
+    процесс жив, watchdog пингует, но getUpdates-соединение висит внутри aiohttp
+    без таймаута — апдейты не идут, systemd этого не видит). С вебхуком Telegram
+    сам присылает апдейты POST-запросами: зависший NIM-запрос блокирует один
+    апдейт (handle_in_background=True), а не весь приём сообщений.
+
+    Безопасность: secret_token в заголовке X-Telegram-Bot-Api-Secret-Token
+    (Telegram подставляет его сам; всё остальное — 403). HTTPS — self-signed
+    сертификат, публичная часть которого загружается в Telegram через
+    set_webhook (официально поддерживаемый сценарий для IP-хостов).
+    """
+    from aiohttp import web
+    from aiogram.webhook.aiohttp_server import (
+        SimpleRequestHandler,
+        setup_application,
+    )
+
+    app = web.Application()
+    webhook_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        handle_in_background=True,  # не держим Telegram ждущим долгий NIM-ответ
+        secret_token=cfg.webhook_secret,
+    )
+    webhook_handler.register(app, path=cfg.webhook_path)
+    setup_application(app, dp)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site_kwargs = {}
+    if cfg.webhook_cert_path:
+        import ssl
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(cfg.webhook_cert_path, cfg.webhook_key_path)
+        site_kwargs["ssl_context"] = ssl_ctx
+    site = web.TCPSite(
+        runner,
+        host=cfg.webhook_listen_host,
+        port=cfg.webhook_port,
+        **site_kwargs,
+    )
+    await site.start()
+    logger.info(
+        "Webhook-сервер запущен: %s:%s%s (secret: %s, cert: %s)",
+        cfg.webhook_listen_host, cfg.webhook_port, cfg.webhook_path,
+        "задан" if cfg.webhook_secret else "НЕТ",
+        "да" if cfg.webhook_cert_path else "нет",
+    )
+
+    # Регистрируем вебхук в Telegram: URL + (для self-signed) публичный сертификат.
+    # drop_pending_updates=False — накопившиеся за офлайн апдейты обрабатываем.
+    webhook_url = cfg.webhook_public_url or (
+        f"https://{cfg.webhook_host_ip}:{cfg.webhook_port}{cfg.webhook_path}"
+    )
+    cert_file = open(cfg.webhook_cert_path, "rb") if cfg.webhook_cert_path else None
+    try:
+        await bot.set_webhook(
+            webhook_url,
+            certificate=cert_file,
+            secret_token=cfg.webhook_secret or None,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=False,
+        )
+        logger.info("set_webhook OK: %s", webhook_url)
+    finally:
+        if cert_file:
+            cert_file.close()
+
+    # Висим, пока не придёт сигнал остановки (systemd SIGTERM → grpcace через
+    # loop.add_signal_handler в polling-режиме нет — тут ставим свой хендлер).
+    import signal
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:  # Windows
+            pass
+    logger.info("Run webhook for bot @%s", (await bot.me()).username)
+    await stop_event.wait()
+
+    # Снятие вебхука при остановке не делаем: при следующем старте он
+    # перезапишется, а Telegram и так ретраит недоставленные апдейты.
+    await runner.cleanup()
 
 
 if __name__ == "__main__":

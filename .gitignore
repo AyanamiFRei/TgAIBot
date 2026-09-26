@@ -1,5 +1,7 @@
 # Секреты
 .env
+*.pem
+*.key
 
 # Python
 __pycache__/

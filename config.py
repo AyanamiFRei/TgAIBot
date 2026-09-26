@@ -52,6 +52,21 @@ class Config:
     proactive_min_loop_min: float
     proactive_temperature: float
     proactive_max_tokens: int
+    # Webhook-режим: приём апдейтов POST-запросами от Telegram вместо long-polling.
+    # Long-polling в aiogram 3.13 зависал намертво (см. _run_webhook в bot.py).
+    webhook_mode: bool
+    webhook_listen_host: str
+    webhook_port: int
+    webhook_path: str
+    webhook_secret: str
+    # Self-signed сертификат: Telegram принимает его, если публичную часть
+    # загрузить в set_webhook. Пусто — HTTPS не терминируем (нужен reverse proxy).
+    webhook_cert_path: str
+    webhook_key_path: str
+    # Публичный URL вебхука (если задан — используется вместо сборки из IP).
+    webhook_public_url: str
+    # IP хоста для сборки URL вебхука (если webhook_public_url не задан).
+    webhook_host_ip: str
 
     @property
     def db_full_path(self) -> str:
@@ -140,6 +155,14 @@ def get_config() -> Config:
             + f"\nШаблон лежит в {PROJECT_DIR/'.env.example'}."
         )
 
+    # Webhook-режим: путь без secret_token открыт любому — требуем secret.
+    webhook_secret = (os.getenv("WEBHOOK_SECRET") or "").strip()
+    if _get_bool("WEBHOOK_MODE", False) and not webhook_secret:
+        raise RuntimeError(
+            "WEBHOOK_MODE=1, но не задан WEBHOOK_SECRET в .env — "
+            "без него путь вебхука открыт любому. Сгенерируйте: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+
     _config = Config(
         bot_token=bot_token,
         ai_provider=ai_provider,
@@ -187,5 +210,16 @@ def get_config() -> Config:
         proactive_min_loop_min=_get_float("PROACTIVE_MIN_LOOP_MIN", 10.0),
         proactive_temperature=_get_float("PROACTIVE_TEMPERATURE", 0.7),
         proactive_max_tokens=_get_int("PROACTIVE_MAX_TOKENS", 256),
+        # Webhook (WEBHOOK_MODE=1 в .env): aiohttp-сервер вместо polling.
+        webhook_mode=_get_bool("WEBHOOK_MODE", False),
+        webhook_listen_host=(os.getenv("WEBHOOK_LISTEN_HOST") or "0.0.0.0"),
+        webhook_port=_get_int("WEBHOOK_PORT", 88),
+        webhook_path=(os.getenv("WEBHOOK_PATH") or "/webhook"),
+        # Secret-token обязателен в webhook-режиме — единственная защита пути.
+        webhook_secret=(os.getenv("WEBHOOK_SECRET") or "").strip(),
+        webhook_cert_path=(os.getenv("WEBHOOK_CERT_PATH") or "").strip(),
+        webhook_key_path=(os.getenv("WEBHOOK_KEY_PATH") or "").strip(),
+        webhook_public_url=(os.getenv("WEBHOOK_PUBLIC_URL") or "").strip(),
+        webhook_host_ip=(os.getenv("WEBHOOK_HOST_IP") or "").strip(),
     )
     return _config
