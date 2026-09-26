@@ -184,22 +184,15 @@ async def _run_webhook(bot: Bot, dp: Dispatcher, cfg: Config) -> None:
     webhook_url = cfg.webhook_public_url or (
         f"https://{cfg.webhook_host_ip}:{cfg.webhook_port}{cfg.webhook_path}"
     )
-    cert_file = None
-    if cfg.webhook_cert_path:
-        from aiogram.types import FSInputFile
-        cert_file = FSInputFile(cfg.webhook_cert_path)
-    try:
-        await bot.set_webhook(
-            webhook_url,
-            certificate=cert_file,
-            secret_token=cfg.webhook_secret or None,
-            allowed_updates=dp.resolve_used_update_types(),
-            drop_pending_updates=False,
-        )
-        logger.info("set_webhook OK: %s", webhook_url)
-    finally:
-        if cert_file:
-            cert_file.close()
+    cert_file = FSInputFile(cfg.webhook_cert_path) if cfg.webhook_cert_path else None
+    await bot.set_webhook(
+        webhook_url,
+        certificate=cert_file,
+        secret_token=cfg.webhook_secret or None,
+        allowed_updates=dp.resolve_used_update_types(),
+        drop_pending_updates=False,
+    )
+    logger.info("set_webhook OK: %s", webhook_url)
 
     # Висим, пока не придёт сигнал остановки (systemd SIGTERM → grpcace через
     # loop.add_signal_handler в polling-режиме нет — тут ставим свой хендлер).
