@@ -52,6 +52,11 @@ class Config:
     proactive_min_loop_min: float
     proactive_temperature: float
     proactive_max_tokens: int
+    # Автокомпакт памяти: фоновое сжатие старой истории в краткое изложение.
+    # compact_keep_recent — сколько последних сообщений держать вне памяти;
+    # compact_wake_min — период проверки фонового цикла (минуты).
+    compact_keep_recent: int
+    compact_wake_min: float
     # Webhook-режим: приём апдейтов POST-запросами от Telegram вместо long-polling.
     # Long-polling в aiogram 3.13 зависал намертво (см. _run_webhook в bot.py).
     webhook_mode: bool
@@ -210,6 +215,9 @@ def get_config() -> Config:
         proactive_min_loop_min=_get_float("PROACTIVE_MIN_LOOP_MIN", 10.0),
         proactive_temperature=_get_float("PROACTIVE_TEMPERATURE", 0.7),
         proactive_max_tokens=_get_int("PROACTIVE_MAX_TOKENS", 256),
+        # Автокомпакт памяти (COMPACT_KEEP_RECENT/COMPACT_WAKE_MIN в .env).
+        compact_keep_recent=_get_int("COMPACT_KEEP_RECENT", 20),
+        compact_wake_min=_get_float("COMPACT_WAKE_MIN", 5.0),
         # Webhook (WEBHOOK_MODE=1 в .env): aiohttp-сервер вместо polling.
         webhook_mode=_get_bool("WEBHOOK_MODE", False),
         webhook_listen_host=(os.getenv("WEBHOOK_LISTEN_HOST") or "0.0.0.0"),

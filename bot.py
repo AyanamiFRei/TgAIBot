@@ -18,6 +18,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import db
 import handlers
+import memory_compactor
 import proactive
 import stickers as stickers_module
 from config import get_config
@@ -109,6 +110,13 @@ async def main() -> None:
     proactive_task = asyncio.create_task(
         proactive.proactive_loop(bot, conn, ai, cfg, sticker_store)
     )
+    # Автокомпакт памяти: фоновый цикл сжатия старой истории в краткое изложение.
+    # Промпт остаётся небольшим → короткий reasoning-поток → быстрые ответы.
+    compactor_task = asyncio.create_task(
+        memory_compactor.memory_compactor_loop(
+            conn, ai, cfg.compact_keep_recent, cfg.compact_wake_min,
+        )
+    )
     try:
         if cfg.webhook_mode:
             await _run_webhook(bot, dp, cfg)
@@ -116,10 +124,12 @@ async def main() -> None:
             await dp.start_polling(bot)
     finally:
         proactive_task.cancel()
-        try:
-            await proactive_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001, PERF203
-            pass
+        compactor_task.cancel()
+        for task in (proactive_task, compactor_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, PERF203
+                pass
         await ai.aclose()
         if vision_ai is not ai:
             await vision_ai.aclose()

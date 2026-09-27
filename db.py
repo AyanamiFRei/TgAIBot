@@ -35,6 +35,16 @@ CREATE TABLE IF NOT EXISTS personas (
     source_raw TEXT,
     updated_at INTEGER NOT NULL
 );
+
+-- Автокомпакт памяти: старые сообщения сжимаются моделью в краткие факты.
+-- compacted_until = id последнего сообщения, которое ВОШЛО в память.
+CREATE TABLE IF NOT EXISTS memories (
+    user_id         INTEGER PRIMARY KEY,
+    content         TEXT    NOT NULL,   -- краткое изложение важного (память)
+    compacted_until INTEGER NOT NULL,   -- id последнего вошедшего в память сообщения
+    updated_at      INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+);
 """
 
 
@@ -130,25 +140,26 @@ def get_recent_budget(
 ) -> list[sqlite3.Row]:
     """Последние реплики диалога в хронологическом порядке, в бюджете по длине.
 
-    glm-5.3-flash держит большой контекст, но гонять туда всю историю на каждый
-    запрос бессмысленно — обработка промпта линейна по длине, длинный контекст
-    только тормозит генерацию. Для живого чата достаточно осмысленного хвоста
-    ~3-5k токенов (≈10-16k символов). Поэтому ограничиваем суммарной длиной,
-    а не числом сообщений: короткая переписка влезет целиком, длинная обрежется
-    до хвоста. hard_limit — страховочный потолок числа строк (от мега-реплик).
+    Автокомпакт: если у юзера есть память (сжатое изложение старой истории),
+    она возвращается ПЕРВОЙ строкой с role='memory' (в _build_messages
+    превращается в system-блок «Что было раньше»), а дальше — только свежий
+    хвост (сообщения после compacted_until) в бюджете max_chars. Промпт остаётся
+    небольшим: старая переписка не гоняется на каждый запрос, только её краткое
+    изложение → короткий reasoning-поток и быстрые ответы.
 
-    Кеш: подрезка идёт с гистерезисом в checkpoint_granularity символов. Без него
-    граница обрезки ползла бы с каждой новой репликой — как только старая реплика
-    выпадает спереди, префикс [system + история] меняется с самого начала и кеш
-    промпта сбрасывается целиком. С гистерезисом следующая подрезка случается
-    только через ~checkpoint_granularity символов новой переписки, а между ними
-    префикс стабилен и попадает в кеш. Плата — до checkpoint_granularity символов
-    недоступной истории, что дешевле регулярной переобработки всего префикса.
+    Кеш: подрезка хвоста идёт с гистерезисом в checkpoint_granularity символов.
+    Без него граница обрезки ползла бы с каждой новой репликой — как только
+    старая реплика выпадает спереди, префикс [system + история] меняется с
+    самого начала и кеш промпта сбрасывается целиком. С гистерезисом следующая
+    подрезка случается только через ~checkpoint_granularity символов новой
+    переписки, а между ними префикс стабилен и попадает в кеш.
     """
     cur = conn.execute(
         "SELECT role, kind, content FROM messages "
-        "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, hard_limit),
+        "WHERE user_id = ? AND id > COALESCE("
+        "  (SELECT compacted_until FROM memories WHERE user_id = ?), 0) "
+        "ORDER BY id DESC LIMIT ?",
+        (user_id, user_id, hard_limit),
     )
     rows = list(cur.fetchall())
     rows.reverse()
@@ -177,7 +188,15 @@ def get_recent_budget(
             if total_tail > budget:
                 kept_start = i + 1
                 break
-    return rows[kept_start:]
+
+    result: list = []
+    memory = get_memory(conn, user_id)
+    if memory is not None and memory["content"]:
+        # Память первой строкой — _build_messages превратит её в system-блок
+        # «Что было раньше». Синтетический row с role='memory'.
+        result.append({"role": "memory", "kind": "memory", "content": memory["content"]})
+    result.extend(rows[kept_start:])
+    return result
 
 
 def get_persona(conn: sqlite3.Connection, user_id: int) -> Persona | None:
@@ -230,11 +249,11 @@ def last_activity_per_user(conn: sqlite3.Connection) -> dict[int, int]:
 
 
 def last_row(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
-    """Самая свежая реплика юзера (по id DESC). Ключи: role, kind, content, created_at.
+    """Самая свежая реплика юзера (по id DESC). Ключи: id, role, kind, content, created_at.
     Нужна чтобы понять, был ли последний ход от юзера (motive 'silence') или от
     бота (motive 'continuation')."""
     cur = conn.execute(
-        "SELECT role, kind, content, created_at FROM messages "
+        "SELECT id, role, kind, content, created_at FROM messages "
         "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
         (user_id,),
     )
@@ -264,3 +283,51 @@ def last_proactive_ts(conn: sqlite3.Connection, user_id: int) -> int | None:
     )
     row = cur.fetchone()
     return int(row["created_at"]) if row else None
+
+
+# --- Автокомпакт памяти: сжатие старой истории в краткое изложение ---
+
+def get_memory(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row | None:
+    """Память юзера (content + compacted_until) или None, если компактации не было."""
+    cur = conn.execute(
+        "SELECT content, compacted_until FROM memories WHERE user_id = ?",
+        (user_id,),
+    )
+    return cur.fetchone()
+
+
+def set_memory(
+    conn: sqlite3.Connection,
+    user_id: int,
+    content: str,
+    compacted_until: int,
+) -> None:
+    """Записать/обновить память: краткое изложение важного + id последнего
+    сообщения, которое вошло в неё. ON CONFLICT — памяти одна на юзера."""
+    conn.execute(
+        "INSERT INTO memories (user_id, content, compacted_until, updated_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET "
+        "  content = excluded.content, "
+        "  compacted_until = excluded.compacted_until, "
+        "  updated_at = excluded.updated_at",
+        (user_id, content, compacted_until, int(time.time())),
+    )
+    conn.commit()
+
+
+def messages_to_compact(
+    conn: sqlite3.Connection,
+    user_id: int,
+    from_id_exclusive: int | None,
+    until_id_inclusive: int,
+) -> list[sqlite3.Row]:
+    """Сообщения в диапазоне (from_id_exclusive, until_id_inclusive] в
+    хронологическом порядке — то, что пойдёт в компактацию."""
+    cur = conn.execute(
+        "SELECT id, role, kind, content FROM messages "
+        "WHERE user_id = ? AND id > COALESCE(?, 0) AND id <= ? "
+        "ORDER BY id ASC",
+        (user_id, from_id_exclusive, until_id_inclusive),
+    )
+    return list(cur.fetchall())

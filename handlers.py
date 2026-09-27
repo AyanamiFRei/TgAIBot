@@ -120,8 +120,20 @@ async def _build_messages(
     for row in history:
         role = row["role"]
         content = row["content"]
+        # Память (автокомпакт старой истории) — отдельным system-блоком «Что было
+        # раньше», не user/assistant-репликой: модель не должна путать её с ходами.
+        if role == "memory":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Что было раньше (краткая память о старой переписке, которая уже "
+                    "не входит в диалог выше):\n" + content +
+                    "\nЭто реально было — опирайся на это, если собеседник ссылается "
+                    "на старые темы; в видимой истории их уже нет."
+                ),
+            })
         # Картинки старых реплик не переотправляем — только текст/плашку.
-        if role == "user":
+        elif role == "user":
             messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": "assistant", "content": content})
