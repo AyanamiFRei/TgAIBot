@@ -77,7 +77,11 @@ class CloudflareClient:
             headers={
                 "Content-Type": "application/json",
             },
-            timeout=httpx.Timeout(90.0, connect=15.0),
+            # Read-таймаут 300с: NIM отвечает заголовками и через 200+ секунд
+            # (замер прокси 27.09: headers=211837ms на крошечном запросе) —
+            # 90с не хватало, бот отваливался до первого байта. Webhook-режим
+            # делает долгое ожидание безопасным (Telegram сам ретраит).
+            timeout=httpx.Timeout(300.0, connect=15.0),
         )
 
     @property
