@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -45,6 +48,23 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at      INTEGER NOT NULL,
     FOREIGN KEY (user_id) REFERENCES users (user_id)
 );
+
+-- Долговременная память фактами (замена плоской memories-сводки): один факт —
+-- одна строка с категорией. Кураторка обновляет точечно (add/update/drop),
+-- факты не теряются при перегенерации. category='legacy' — старая flat-сводка
+-- после миграции, кураторка раскладывает её по категориям на первом витке.
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    category      TEXT    NOT NULL,  -- identity|preferences|projects|relationships|ongoing|events|legacy
+    content       TEXT    NOT NULL,  -- один факт, кратко
+    source_msg_id INTEGER,           -- id сообщения-источника (provenance), может быть NULL
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_user ON memory_facts (user_id, category);
 """
 
 
@@ -64,8 +84,35 @@ def connect(db_path: str) -> sqlite3.Connection:
     # «database is locked», что нормально для низконагруженного личного бота.
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
+    _migrate_flat_memory(conn)
     conn.commit()
     return conn
+
+
+def _migrate_flat_memory(conn: sqlite3.Connection) -> None:
+    """Миграция: старая flat-сводка из memories → один legacy-факт в memory_facts.
+
+    Сводку НЕ парсим (она смесь фактов и пересказов — NLP-парсинг хрупок):
+    записываем целиком одним фактом category='legacy', кураторка на первом витке
+    сама выделит факты и разложит по категориям. compacted_until остаётся в
+    memories и продолжает фильтровать хвост истории тем же кодом. Idempotent:
+    legacy-факт на юзера один (проверка перед вставкой)."""
+    rows = conn.execute(
+        "SELECT m.user_id, m.content FROM memories m "
+        "WHERE m.content != '' AND NOT EXISTS ("
+        "  SELECT 1 FROM memory_facts f "
+        "  WHERE f.user_id = m.user_id AND f.category = 'legacy')"
+    ).fetchall()
+    now = int(time.time())
+    for row in rows:
+        conn.execute(
+            "INSERT INTO memory_facts (user_id, category, content, source_msg_id, created_at, updated_at) "
+            "VALUES (?, 'legacy', ?, NULL, ?, ?)",
+            (row["user_id"], row["content"], now, now),
+        )
+        logger.debug("миграция: flat-память user=%s → legacy-факт", row["user_id"])
+    if rows:
+        conn.commit()
 
 
 def ensure_user(conn: sqlite3.Connection, user_id: int) -> None:
@@ -118,19 +165,6 @@ def add_message(
     conn.commit()
 
 
-def get_recent(
-    conn: sqlite3.Connection, user_id: int, limit: int
-) -> list[sqlite3.Row]:
-    cur = conn.execute(
-        "SELECT role, kind, content FROM messages "
-        "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, limit),
-    )
-    rows = cur.fetchall()
-    rows.reverse()  # хронологический порядок
-    return list(rows)
-
-
 def get_recent_budget(
     conn: sqlite3.Connection,
     user_id: int,
@@ -140,12 +174,12 @@ def get_recent_budget(
 ) -> list[sqlite3.Row]:
     """Последние реплики диалога в хронологическом порядке, в бюджете по длине.
 
-    Автокомпакт: если у юзера есть память (сжатое изложение старой истории),
-    она возвращается ПЕРВОЙ строкой с role='memory' (в _build_messages
-    превращается в system-блок «Что было раньше»), а дальше — только свежий
-    хвост (сообщения после compacted_until) в бюджете max_chars. Промпт остаётся
-    небольшим: старая переписка не гоняется на каждый запрос, только её краткое
-    изложение → короткий reasoning-поток и быстрые ответы.
+    Долговременная память фактами: если у юзера есть факты (memory_facts), они
+    возвращаются ПЕРВОЙ строкой с role='memory' и content=компактный блок по
+    категориям (_build_messages превращает её в system-блок), а дальше — только
+    свежий хвост (сообщения после compacted_until) в бюджете max_chars. Промпт
+    остаётся небольшим: старая переписка не гоняется на каждый запрос, только
+    её факт-блок → короткий reasoning-поток и быстрые ответы.
 
     Кеш: подрезка хвоста идёт с гистерезисом в checkpoint_granularity символов.
     Без него граница обрезки ползла бы с каждой новой репликой — как только
@@ -190,11 +224,17 @@ def get_recent_budget(
                 break
 
     result: list = []
-    memory = get_memory(conn, user_id)
-    if memory is not None and memory["content"]:
-        # Память первой строкой — _build_messages превратит её в system-блок
-        # «Что было раньше». Синтетический row с role='memory'.
-        result.append({"role": "memory", "kind": "memory", "content": memory["content"]})
+    facts = get_facts(conn, user_id)
+    if facts:
+        # Факты первой строкой — компактный блок по категориям (build_memory_block
+        # в memory_compactor.py собирает текст; здесь — единый content). Синтетический
+        # row с role='memory', _build_messages превратит его в system-блок.
+        from memory_compactor import build_memory_block
+        result.append({
+            "role": "memory",
+            "kind": "memory",
+            "content": build_memory_block(facts),
+        })
     result.extend(rows[kept_start:])
     return result
 
@@ -331,3 +371,54 @@ def messages_to_compact(
         (user_id, from_id_exclusive, until_id_inclusive),
     )
     return list(cur.fetchall())
+
+
+# --- Долговременная память фактами (замена плоской memories-сводки) ---
+
+def get_facts(conn: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
+    """Все факты юзера по категориям (id, category, content, updated_at)."""
+    cur = conn.execute(
+        "SELECT id, category, content, updated_at FROM memory_facts "
+        "WHERE user_id = ? ORDER BY category ASC, updated_at ASC",
+        (user_id,),
+    )
+    return list(cur.fetchall())
+
+
+def add_fact(
+    conn: sqlite3.Connection,
+    user_id: int,
+    category: str,
+    content: str,
+    source_msg_id: int | None = None,
+) -> int:
+    """Добавить факт (одну строку). Возвращает id нового факта."""
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO memory_facts (user_id, category, content, source_msg_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, category, content, source_msg_id, now, now),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def update_fact(conn: sqlite3.Connection, fact_id: int, content: str) -> None:
+    """Заострить/уточнить существующий факт (id обязателен — кураторка диффует)."""
+    conn.execute(
+        "UPDATE memory_facts SET content = ?, updated_at = ? WHERE id = ?",
+        (content, int(time.time()), fact_id),
+    )
+    conn.commit()
+
+
+def drop_facts(conn: sqlite3.Connection, fact_ids: list[int]) -> None:
+    """Удалить устаревшие/неверные факты по списку id."""
+    if not fact_ids:
+        return
+    placeholders = ",".join("?" for _ in fact_ids)
+    conn.execute(
+        f"DELETE FROM memory_facts WHERE id IN ({placeholders})",
+        tuple(fact_ids),
+    )
+    conn.commit()

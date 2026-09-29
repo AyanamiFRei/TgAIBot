@@ -96,6 +96,10 @@ async def run_db(fn, *args, **kwargs):
 # Сборка запроса и потоковая отправка ответа
 # ---------------------------------------------------------------------------
 
+# Быстрый путь «запомни: X»: явная просьба запомнить факт. Проверено на живых
+# строках: «запомни: я вегетарианец», «Запомни, что я делаю игру», «запомни - ...».
+_REMEMBER_RE = re.compile(r"^\s*запомни[,:-]?\s+(.+)$", re.IGNORECASE)
+
 async def _build_messages(
     message: Message,
     cfg: Config,
@@ -234,6 +238,7 @@ async def _stream_reply(
             messages,
             temperature=cfg.temperature,
             max_tokens=cfg.max_tokens,
+            reasoning_effort=getattr(cfg, "reasoning_effort", None) or None,
         ):
             buf_holder[0] += chunk
             await _drain_boundaries(bot, chat_id, buf_holder, sent, stickers)
@@ -899,6 +904,21 @@ async def handle_text(
     if await run_db(db.is_dup_user_text, conn, message.from_user.id, text):
         logger.info("дубль user-text пропущен user=%s text=%r", message.from_user.id, text[:60])
         return
+
+    # Быстрый путь «запомни: X»: явная просьба что-то запомнить — факт пишется
+    # сразу (без ожидания фонового витка кураторки), category='legacy' —
+    # кураторка потом разложит по категориям. Ответ бота идёт как обычно
+    # (модель видит фразу в истории и реагирует в своём характере).
+    remember_match = _REMEMBER_RE.match(text)
+    if remember_match:
+        fact_text = remember_match.group(1).strip()
+        await run_db(
+            db.add_fact, conn, message.from_user.id, "legacy", fact_text,
+            source_msg_id=None,
+        )
+        logger.info(
+            "запомни user=%s: факт записан сразу %r", message.from_user.id, fact_text[:60]
+        )
 
     messages = await _build_messages(message, cfg, conn, stickers, text)
 

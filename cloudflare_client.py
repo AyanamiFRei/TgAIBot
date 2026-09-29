@@ -120,6 +120,7 @@ class CloudflareClient:
         temperature: float = 0.7,
         max_tokens: int = 512,
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         payload = {
             "model": model or self._active_model,
@@ -128,6 +129,10 @@ class CloudflareClient:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if reasoning_effort:
+            # Топ-левель поле payload: NIM glm-5.3-flash уважает reasoning_effort
+            # ('low' — без размышлений), но игнорирует chat_template_kwargs.
+            payload["reasoning_effort"] = reasoning_effort
         last_exc: Exception | None = None
         attempt = 0
         while attempt < 5:
@@ -219,6 +224,7 @@ class CloudflareClient:
         temperature: float = 0.7,
         max_tokens: int = 512,
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[str]:
         payload = {
             "model": model or self._active_model,
@@ -227,6 +233,9 @@ class CloudflareClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
+        if reasoning_effort:
+            # Топ-левель поле: NIM уважает reasoning_effort, chat_template_kwargs игнорирует.
+            payload["reasoning_effort"] = reasoning_effort
         last_exc: Exception | None = None
         attempt = 0
         while attempt < 5:

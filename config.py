@@ -57,6 +57,9 @@ class Config:
     # compact_wake_min — период проверки фонового цикла (минуты).
     compact_keep_recent: int
     compact_wake_min: float
+    # Reasoning effort для NIM glm-5.3-flash: 'low' — без размышлений (проверено:
+    # NIM уважает reasoning_effort, chat_template_kwargs игнорирует). Пусто — не шлём.
+    reasoning_effort: str
     # Webhook-режим: приём апдейтов POST-запросами от Telegram вместо long-polling.
     # Long-polling в aiogram 3.13 зависал намертво (см. _run_webhook в bot.py).
     webhook_mode: bool
@@ -218,6 +221,8 @@ def get_config() -> Config:
         # Автокомпакт памяти (COMPACT_KEEP_RECENT/COMPACT_WAKE_MIN в .env).
         compact_keep_recent=_get_int("COMPACT_KEEP_RECENT", 20),
         compact_wake_min=_get_float("COMPACT_WAKE_MIN", 5.0),
+        # Reasoning effort (REASONING_EFFORT в .env): 'low' — без размышлений.
+        reasoning_effort=(os.getenv("REASONING_EFFORT") or "").strip(),
         # Webhook (WEBHOOK_MODE=1 в .env): aiohttp-сервер вместо polling.
         webhook_mode=_get_bool("WEBHOOK_MODE", False),
         webhook_listen_host=(os.getenv("WEBHOOK_LISTEN_HOST") or "0.0.0.0"),
