@@ -108,7 +108,7 @@ async def build_proactive_messages(
     messages: list[dict] = [
         {
             "role": "system",
-            "content": prompts.build_system_proactive(
+            "content": prompts.build_system(
                 persona.summary if persona else None, sticker_vibes,
             ),
         }
@@ -116,14 +116,32 @@ async def build_proactive_messages(
     for row in history:
         role = row["role"]
         content = row["content"]
-        if role == "user":
+        # Память фактами — тем же system-блоком, что и в обычном диалоге
+        # (см. handlers._build_messages), не user/assistant-репликой.
+        if role == "memory":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Что было раньше (долговременная память о собеседнике):\n" + content +
+                    "\nЭто реально было — опирайся на это, если собеседник ссылается "
+                    "на старые темы; в видимой истории их уже нет."
+                ),
+            })
+        elif role == "user":
             messages.append({"role": "user", "content": content})
         else:
             messages.append({"role": "assistant", "content": content})
     # Хвост — синтетический user-ход с инструкцией (в БД не пишется, юзеру не
     # показывается). OpenAI-совместимый протокол требует user последним ходом —
     # «пустого» хода у него нет, поэтому инструкция кладётся туда.
-    messages.append({"role": "user", "content": prompts._proactive_user_turn(silence_hours, motive)})
+    tail = prompts._proactive_user_turn(silence_hours, motive)
+    # Плашка времени в тот же хвост (кеш-безопасно): без неё proactive-пинок
+    # в 3 часа ночи юзера выглядит как «доброе утро» — модель не знает времени.
+    from handlers import _time_header
+    header = _time_header(cfg, user_id, conn)
+    if header:
+        tail += "\n\n" + header
+    messages.append({"role": "user", "content": tail})
     return messages
 
 

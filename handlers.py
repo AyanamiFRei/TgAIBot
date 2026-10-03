@@ -16,6 +16,7 @@ on_speaker_chosen ниже). Один спикер — без вопроса. С
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -100,6 +101,62 @@ async def run_db(fn, *args, **kwargs):
 # строках: «запомни: я вегетарианец», «Запомни, что я делаю игру», «запомни - ...».
 _REMEMBER_RE = re.compile(r"^\s*запомни[,:-]?\s+(.+)$", re.IGNORECASE)
 
+def _time_header(cfg: Config, user_id: int, conn: "sqlite3.Connection") -> str:
+    """Короткая плашка «сейчас у собеседника HH:MM, день недели» + «сколько
+    прошло с его последнего сообщения». Уходит В КОНЦЕ последнего user-хода
+    (дописывается к контенту, не в system) — ради кеша промпта: в system она
+    менялась бы от запроса к запросу и сбрасывала префикс на каждом пинке
+    (см. prompts._proactive_block — тот же принцип).
+
+    Без неё модель не знает реального времени (VPS в UTC, юзер может быть
+    в другом поясе): путает утро с вечером («какие пары, три часа ночи?!») и
+    не чувствует, что между сообщениями прошли сутки.
+
+    Время — в зоне cfg.timezone (TIMEZONE в .env); невалидное имя — UTC.
+    Возвращает плашку всегда (даже «только что» — время суток всё равно важно).
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(cfg.timezone)
+    except Exception:  # noqa: BLE001 — нет zoneinfo/невалидное имя
+        from datetime import timezone as _tzmod
+        tz = _tzmod.utc
+
+    now = datetime.datetime.now(tz)
+    dow = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
+    months = ["января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+    parts = [
+        f"[системная плашка: сейчас у собеседника {now.hour:02d}:{now.minute:02d}, "
+        f"{dow}, {now.day} {months[now.month - 1]} {now.year} — учитывай время "
+        "суток и дату в ответе]",
+    ]
+
+    # Прошло с последнего сообщения собеседника — чтобы чувствовать паузу/сутки.
+    try:
+        row = conn.execute(
+            "SELECT created_at FROM messages WHERE user_id = ? AND role = 'user' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        row = None
+    if row is not None:
+        gap_h = (now.timestamp() - row[0]) / 3600.0
+        if gap_h >= 0.17:  # >10 минут — уже не «только что»
+            if gap_h >= 24:
+                gap_line = f"с последнего его сообщения прошло больше суток ({gap_h:.0f} ч)"
+            elif gap_h >= 1:
+                gap_line = f"с последнего его сообщения прошло {gap_h:.1f} ч"
+            else:
+                gap_line = f"с последнего его сообщения прошло {gap_h * 60:.0f} минут"
+            parts.append(
+                f"[системная плашка: {gap_line} — учитывай паузу, не делай вид, "
+                "что разговор не прерывался]"
+            )
+    return " ".join(parts)
+
+
 async def _build_messages(
     message: Message,
     cfg: Config,
@@ -143,6 +200,12 @@ async def _build_messages(
             messages.append({"role": "assistant", "content": content})
 
     messages.append({"role": "user", "content": current_user_content})
+    # Плашка времени — допиской в хвост последнего user-хода (кеш-безопасно:
+    # system байт-идентичен, меняется только маленький хвост, см. _time_header).
+    if isinstance(current_user_content, str):
+        header = _time_header(cfg, message.from_user.id, conn)
+        if header:
+            messages[-1]["content"] += "\n\n" + header
     return messages
 
 
@@ -845,8 +908,12 @@ async def _media_turn(
     current_user_content: list[dict] | str = user_text
     used_ai = ai
     if image_data_uri:
+        # Плашка времени для медиа-хода — внутрь text-блока (кеш: меняется только
+        # маленький хвост текущего user-хода, префикс [system + история] цел).
+        header = _time_header(cfg, message.from_user.id, conn)
+        text_with_header = (user_text + "\n\n" + header) if header else user_text
         current_user_content = [
-            {"type": "text", "text": user_text},
+            {"type": "text", "text": text_with_header},
             media.image_content_block(image_data_uri, cfg.vision_provider),
         ]
         used_ai = vision_ai

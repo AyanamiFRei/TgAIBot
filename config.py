@@ -41,6 +41,10 @@ class Config:
     max_tokens: int
     temperature: float
     msg_split_delay: float
+    # Локальная зона собеседника (TIMEZONE в .env, напр. "Europe/Moscow"): боту
+    # нужно знать «сейчас сколько времени у юзера» — иначе он путает утро/вечер
+    # и не чувствует, что между сообщениями прошли сутки. VPS живёт в UTC.
+    timezone: str
     db_path: str
     sticker_pack: str
     # Proactive messaging — бот иногда пишет первым.
@@ -202,11 +206,14 @@ def get_config() -> Config:
         nvidia_fallback_model=(os.getenv("NVIDIA_FALLBACK_MODEL") or "").strip(),
         # Лёгкая vision-модель: только описывает фото/стикер в 1-2 предложения,
         # описание потом подмешивается в основной диалог как текст.
-        history_window=_get_int("HISTORY_WINDOW", 400),
+        history_window=_get_int("HISTORY_WINDOW", 32),
         history_chars=_get_int("HISTORY_CHARS", 12000),
-        max_tokens=_get_int("MAX_TOKENS", 512),
+        max_tokens=_get_int("MAX_TOKENS", 768),
         temperature=_get_float("TEMPERATURE", 0.7),
         msg_split_delay=_get_float("MSG_SPLIT_DELAY", 0.8),
+        # Локальная зона собеседника: "Europe/Moscow" по умолчанию (юзер в UTC+3).
+        # Невалидное имя — молча откатываемся на UTC (см. handlers._time_header).
+        timezone=(os.getenv("TIMEZONE") or "Europe/Moscow").strip(),
         db_path=os.getenv("DB_PATH") or "bot.db",
         sticker_pack=(os.getenv("STICKER_PACK") or "").strip(),
         # Proactive: по умолчанию ВЫКЛ (PROACTIVE пусто/false). Opt-in.
@@ -217,7 +224,7 @@ def get_config() -> Config:
         proactive_max_per_day=_get_int("PROACTIVE_MAX_PER_DAY", 2),
         proactive_min_loop_min=_get_float("PROACTIVE_MIN_LOOP_MIN", 10.0),
         proactive_temperature=_get_float("PROACTIVE_TEMPERATURE", 0.7),
-        proactive_max_tokens=_get_int("PROACTIVE_MAX_TOKENS", 256),
+        proactive_max_tokens=_get_int("PROACTIVE_MAX_TOKENS", 384),
         # Автокомпакт памяти (COMPACT_KEEP_RECENT/COMPACT_WAKE_MIN в .env).
         compact_keep_recent=_get_int("COMPACT_KEEP_RECENT", 20),
         compact_wake_min=_get_float("COMPACT_WAKE_MIN", 5.0),
