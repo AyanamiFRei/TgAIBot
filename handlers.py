@@ -157,6 +157,21 @@ def _time_header(cfg: Config, user_id: int, conn: "sqlite3.Connection") -> str:
     return " ".join(parts)
 
 
+async def _check_session_timeout(
+    conn: "sqlite3.Connection",
+    user_id: int,
+    timeout_h: float,
+) -> None:
+    """Если с последнего сообщения прошло больше timeout_h — завершаем прошлую сессию,
+    перенося её дайджест в prev_digest для мягкого перехода."""
+    last_ts = await run_db(db.last_any_msg_ts, conn, user_id)
+    if last_ts is not None:
+        import time as _t
+        gap_h = (_t.time() - last_ts) / 3600.0
+        if gap_h >= timeout_h:
+            await run_db(db.finalize_session, conn, user_id)
+
+
 async def _build_messages(
     message: Message,
     cfg: Config,
@@ -191,6 +206,25 @@ async def _build_messages(
                     "не входит в диалог выше):\n" + content +
                     "\nЭто реально было — опирайся на это, если собеседник ссылается "
                     "на старые темы; в видимой истории их уже нет."
+                ),
+            })
+        # Дайджест предыдущей сессии (разговор до длинной паузы).
+        elif role == "session_prev":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "В прошлый раз (до перерыва) вы говорили вот о чём:\n" + content +
+                    "\nСобеседник может вернуться к этой теме — "
+                    "не отмахивайся, опирайся, если он ссылается."
+                ),
+            })
+        # Дайджест текущей сессии (ранние реплики текущего разговора, уже не дословные).
+        elif role == "session_current":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Ранее в этом разговоре (сжатая сводка, дословные реплики ниже):\n"
+                    + content
                 ),
             })
         # Картинки старых реплик не переотправляем — только текст/плашку.
@@ -828,6 +862,7 @@ async def _media_turn(
     обычный текстовый ai, обращаться к vision-провайдеру незачем.
     """
     await run_db(db.ensure_user, conn, message.from_user.id)
+    await _check_session_timeout(conn, message.from_user.id, cfg.session_timeout_h)
 
     try:
         image_data_uri, kind, extra_text = await media.prepare_media(bot, message)
@@ -972,6 +1007,7 @@ async def handle_text(
     if not text:
         return
     await run_db(db.ensure_user, conn, message.from_user.id)
+    await _check_session_timeout(conn, message.from_user.id, cfg.session_timeout_h)
 
     # Дедуп повторных отправок (Telegram long-poll retry): если ровно такой же
     # ход уже записан за последнее окно — не пишем дубль и не отвечаем again.

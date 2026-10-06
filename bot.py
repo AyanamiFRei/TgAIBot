@@ -115,6 +115,9 @@ async def main() -> None:
     compactor_task = asyncio.create_task(
         memory_compactor.memory_compactor_loop(
             conn, ai, cfg.compact_keep_recent, cfg.compact_wake_min,
+            reasoning_effort=cfg.reasoning_effort,
+            session_keep_recent=cfg.session_keep_recent,
+            session_timeout_h=cfg.session_timeout_h,
         )
     )
     try:

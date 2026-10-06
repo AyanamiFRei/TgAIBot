@@ -250,9 +250,145 @@ async def curate_user_memory(
         dropped = len(diff["drop"])
 
     new_until = to_compact[-1]["id"]
+    await _run_db(db.set_memory, conn, user_id, "", new_until)
     logger.info(
         "кураторка user=%s: +%d/обновлено %d/удалено %d фактов, компакт-покрытие до id=%d",
         user_id, added, updated, dropped, new_until,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Прогрессивный дайджест сессии (промежуточный слой памяти)
+# ---------------------------------------------------------------------------
+
+SESSION_DIGEST_PROMPT = (
+    "Ты — модуль оперативной памяти диалога. Твоя задача — вести краткую текущую сводку разговора.\n"
+    "Ниже — предыдущее состояние сводки (если было) и фрагмент переписки, который выходит из оперативного буфера.\n"
+    "Обнови тему, дайджест и список нерешённых вопросов/висящих тем. Отвечай СТРОГИМ JSON без markdown и пояснений:\n"
+    '{"topic": "...", "digest": "...", "unresolved": "..."}\n\n'
+    "Правила:\n"
+    "- topic: текущая тема обсуждения (1 краткое предложение)\n"
+    "- digest: сжатая суть того, что обсуждалось и к чему пришли (2-4 предложения; факты, решения, выбранные варианты, без воды)\n"
+    "- unresolved: открытые вопросы, нерешённые проблемы, обещания или темы, на которых прервались (если всё закрыто — пустая строка)\n"
+    "- пиши по-русски, кратко, по существу"
+)
+
+
+def _parse_session_digest(raw: str) -> dict | None:
+    """Парсит JSON-дайджест сессии из ответа модели."""
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "topic": str(data.get("topic") or "").strip(),
+        "digest": str(data.get("digest") or "").strip(),
+        "unresolved": str(data.get("unresolved") or "").strip(),
+    }
+
+
+async def update_user_session_digest(
+    conn: "sqlite3.Connection",
+    ai: CloudflareClient,
+    user_id: int,
+    session_keep_recent: int = 10,
+    reasoning_effort: str | None = "low",
+) -> bool:
+    """Прогрессивный дайджест текущей сессии (промежуточный слой памяти).
+
+    Берёт сообщения, которые выходят за рамки session_keep_recent последних реплик,
+    и сжимает их в topic/digest/unresolved. При следующем запросе модель видит этот
+    дайджест как role='session_current' вместо десятков сырых сообщений.
+    """
+    last = await _run_db(db.last_row, conn, user_id)
+    if last is None:
+        return False
+    last_id = last["id"]
+
+    session = await _run_db(db.get_session_state, conn, user_id)
+    digest_until = session["digest_until"] if session else 0
+
+    pending = await _run_db(
+        db.messages_to_compact, conn, user_id, digest_until, last_id,
+    )
+    if len(pending) <= session_keep_recent:
+        return False
+
+    to_digest = pending[:-session_keep_recent] if session_keep_recent else pending
+    if not to_digest:
+        return False
+
+    lines: list[str] = []
+    for row in to_digest:
+        who = "собеседник" if row["role"] == "user" else "ты"
+        content = (row["content"] or "").strip()
+        if content:
+            lines.append(f"{who}: {content}")
+    transcript = "\n".join(lines)
+    if not transcript:
+        return False
+
+    user_prompt = SESSION_DIGEST_PROMPT
+    if session and (session["topic"] or session["digest"] or session["unresolved"]):
+        prev_parts = []
+        if session["topic"]:
+            prev_parts.append(f"Предыдущая тема: {session['topic']}")
+        if session["digest"]:
+            prev_parts.append(f"Предыдущий дайджест: {session['digest']}")
+        if session["unresolved"]:
+            prev_parts.append(f"Открытые вопросы: {session['unresolved']}")
+        user_prompt += "\n\nТекущее состояние:\n" + "\n".join(prev_parts)
+    user_prompt += "\n\nНовые реплики:\n" + transcript
+
+    try:
+        raw = await ai.chat(
+            [
+                {"role": "system", "content": "Ты — модуль оперативной памяти диалога. Отвечай только строгим JSON без пояснений."},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=512,
+            model=None,
+            reasoning_effort=reasoning_effort,
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("сжатие сессионного дайджеста user=%s не удалось", user_id)
+        return False
+
+    parsed = _parse_session_digest(raw)
+    if parsed is None:
+        logger.warning(
+            "сессионный дайджест user=%s: невалидный JSON, виток пропущен: %r",
+            user_id, raw[:200],
+        )
+        return False
+
+    new_digest_until = to_digest[-1]["id"]
+    session_start = session["session_start"] if (session and session["session_start"]) else to_digest[0]["id"]
+    await _run_db(
+        db.upsert_session_state,
+        conn,
+        user_id,
+        digest=parsed["digest"],
+        topic=parsed["topic"],
+        unresolved=parsed["unresolved"],
+        digest_until=new_digest_until,
+        session_start=session_start,
+    )
+    logger.info(
+        "сессионный дайджест user=%s обновлён до msg_id=%d: тема=%r, открытые=%r",
+        user_id, new_digest_until, parsed["topic"][:50], parsed["unresolved"][:50],
     )
     return True
 
@@ -267,24 +403,41 @@ async def memory_compactor_loop(
     keep_recent: int,
     wake_min: float,
     reasoning_effort: str | None = "low",
+    session_keep_recent: int = 10,
+    session_timeout_h: float = 3.5,
 ) -> None:
-    """Просыпается раз в wake_min минут и проверяет всех юзеров: у кого накопилась
-    непокрытая история — кураторит память инкрементальным диффом."""
+    """Просыпается раз в wake_min минут и проверяет всех юзеров:
+    1. Если пауза в общении > session_timeout_h — завершает сессию (дайджест → prev_digest).
+    2. Если накопились непокрытые сообщения в сессии — обновляет сессионный дайджест.
+    3. Если накопилась непокрытая история — кураторит долговременные факты (diff add/update/drop).
+    """
+    import time as _t
     logger.info(
-        "memory_compactor запущен (wake=%.1f min, keep_recent=%d, effort=%s)",
-        wake_min, keep_recent, reasoning_effort or "нет",
+        "memory_compactor запущен (wake=%.1f min, keep_recent=%d, session_keep=%d, timeout=%.1fh, effort=%s)",
+        wake_min, keep_recent, session_keep_recent, session_timeout_h, reasoning_effort or "нет",
     )
     try:
         while True:
             try:
+                now = _t.time()
                 activity = await _run_db(db.last_activity_per_user, conn)
-                for user_id in activity:
+                for user_id, last_ts in activity.items():
                     try:
+                        silence_h = (now - last_ts) / 3600.0
+                        if silence_h >= session_timeout_h:
+                            # Сессия завершилась по паузе — фиксируем в prev_digest
+                            await _run_db(db.finalize_session, conn, user_id)
+                        else:
+                            # Сессия активна — сжимаем вытесненный хвост в дайджест
+                            await update_user_session_digest(
+                                conn, ai, user_id, session_keep_recent, reasoning_effort,
+                            )
+                        # Долговременная кураторка фактов
                         await curate_user_memory(
                             conn, ai, user_id, keep_recent, reasoning_effort,
                         )
                     except Exception:  # noqa: BLE001
-                        logger.exception("кураторка user=%s упала, продолжаю", user_id)
+                        logger.exception("обработка памяти user=%s упала, продолжаю", user_id)
             except Exception:  # noqa: BLE001
                 logger.exception("memory_compactor виток упал")
             await asyncio.sleep(wake_min * 60.0)

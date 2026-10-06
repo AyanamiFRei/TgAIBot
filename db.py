@@ -65,6 +65,24 @@ CREATE TABLE IF NOT EXISTS memory_facts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_facts_user ON memory_facts (user_id, category);
+
+-- Трёхуровневая гибридная память: промежуточный слой «дайджест текущей сессии».
+-- Вместо жёсткого обрезания контекста по N сообщений: сообщения, вытесненные из
+-- дословного окна, прогрессивно сжимаются в rolling-дайджест (тема + суть +
+-- открытые вопросы). При длинной паузе (>SESSION_TIMEOUT_H) дайджест переезжает
+-- в prev_digest, и новая сессия начинается с чистого буфера (но prev_digest
+-- остаётся доступен — юзер может ответить на старую тему после перерыва).
+CREATE TABLE IF NOT EXISTS session_state (
+    user_id         INTEGER PRIMARY KEY,
+    digest          TEXT    NOT NULL DEFAULT '',  -- rolling-дайджест текущей сессии
+    topic           TEXT    NOT NULL DEFAULT '',  -- текущая тема (1-2 предложения)
+    unresolved      TEXT    NOT NULL DEFAULT '',  -- открытые вопросы / задачи
+    digest_until    INTEGER NOT NULL DEFAULT 0,   -- id последнего сообщения, покрытого дайджестом
+    session_start   INTEGER NOT NULL DEFAULT 0,   -- id первого сообщения текущей сессии
+    prev_digest     TEXT    NOT NULL DEFAULT '',  -- дайджест предыдущей сессии (для мягкого перехода)
+    updated_at      INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+);
 """
 
 
@@ -174,30 +192,59 @@ def get_recent_budget(
 ) -> list[sqlite3.Row]:
     """Последние реплики диалога в хронологическом порядке, в бюджете по длине.
 
-    Долговременная память фактами: если у юзера есть факты (memory_facts), они
-    возвращаются ПЕРВОЙ строкой с role='memory' и content=компактный блок по
-    категориям (_build_messages превращает её в system-блок), а дальше — только
-    свежий хвост (сообщения после compacted_until) в бюджете max_chars. Промпт
-    остаётся небольшим: старая переписка не гоняется на каждый запрос, только
-    её факт-блок → короткий reasoning-поток и быстрые ответы.
+    Трёхуровневая гибридная память:
+      1. Долговременные факты (memory_facts) → role='memory'
+      2. Дайджест предыдущей сессии (session_state.prev_digest) → role='session_prev'
+      3. Дайджест текущей сессии (session_state.digest/topic/unresolved) → role='session_current'
+      4. Дословный хвост (свежие сообщения после digest_until или compacted_until)
 
-    Кеш: подрезка хвоста идёт с гистерезисом в checkpoint_granularity символов.
-    Без него граница обрезки ползла бы с каждой новой репликой — как только
-    старая реплика выпадает спереди, префикс [system + история] меняется с
-    самого начала и кеш промпта сбрасывается целиком. С гистерезисом следующая
-    подрезка случается только через ~checkpoint_granularity символов новой
-    переписки, а между ними префикс стабилен и попадает в кеш.
+    Парная защита: контекст никогда не обрезается на ответе ассистента без
+    предшествующего вопроса юзера — если первая реплика в окне 'assistant',
+    она тоже отбрасывается.
+
+    hard_limit — потолок строк из SQL (защита от OOM на огромных историях).
+    Размер окна контролируется max_chars (символьный бюджет), а НЕ числом сообщений.
     """
+    # Нижняя граница: сообщения ДО этого id уже покрыты долговременной памятью.
+    compacted_until_row = conn.execute(
+        "SELECT compacted_until FROM memories WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    compacted_until = compacted_until_row["compacted_until"] if compacted_until_row else 0
+
+    # Сессионная граница: сообщения до digest_until покрыты дайджестом сессии.
+    session = get_session_state(conn, user_id)
+    digest_until = session["digest_until"] if session else 0
+
+    # Начинаем выборку с наибольшей из двух границ — не дублируем информацию.
+    lower_bound = max(compacted_until, digest_until)
+
     cur = conn.execute(
         "SELECT role, kind, content FROM messages "
-        "WHERE user_id = ? AND id > COALESCE("
-        "  (SELECT compacted_until FROM memories WHERE user_id = ?), 0) "
+        "WHERE user_id = ? AND id > ? "
         "ORDER BY id DESC LIMIT ?",
-        (user_id, user_id, hard_limit),
+        (user_id, lower_bound, hard_limit),
     )
     rows = list(cur.fetchall())
+
+    # Гарантия минимального дословного хвоста: если lower_bound отсёк слишком много
+    # (например, сразу после финализации сессии или компактации), модель всё равно
+    # должна видеть последние 6 реплик — иначе она не поймёт, на что именно юзер
+    # отвечает после паузы («Да, во сколько?» на вопрос о встрече).
+    if len(rows) < 6:
+        cur_fallback = conn.execute(
+            "SELECT role, kind, content FROM messages "
+            "WHERE user_id = ? "
+            "ORDER BY id DESC LIMIT 6",
+            (user_id,),
+        )
+        fallback_rows = list(cur_fallback.fetchall())
+        if len(fallback_rows) > len(rows):
+            rows = fallback_rows
+
     rows.reverse()
 
+    # --- Символьный бюджет ---
     total = 0
     kept_start = 0
     for i in range(len(rows) - 1, -1, -1):
@@ -207,14 +254,9 @@ def get_recent_budget(
             kept_start = i + 1
             break
 
+    # Гистерезис: подрезаем не впритык к max_chars, а с запасом в checkpoint
+    # символов, чтобы стабилизировать префикс для KV-кеша промпта.
     if kept_start and 0 < checkpoint_granularity < max_chars:
-        # Гистерезис: подрезаем не впритык к max_chars, а с запасом в checkpoint
-        # символов. Впритык граница ползла бы с каждой новой репликой (каждая
-        # подрезка — снова +1 реплика спереди) — префикс [system + история]
-        # сбрасывался бы почти на каждом запросе. С запасом следующая подрезка
-        # случится только через ~checkpoint символов новой переписки, а между
-        # ними префикс стабилен и попадает в кеш. Плата — checkpoint символов
-        # недоступной истории, что дешевле регулярной переобработки префикса.
         budget = max_chars - checkpoint_granularity
         total_tail = 0
         for i in range(len(rows) - 1, kept_start - 1, -1):
@@ -223,19 +265,54 @@ def get_recent_budget(
                 kept_start = i + 1
                 break
 
+    trimmed = rows[kept_start:]
+
+    # --- Парная защита: не начинаем с оторванного assistant-ответа ---
+    if trimmed and trimmed[0]["role"] == "assistant":
+        trimmed = trimmed[1:]
+
+    # --- Собираем результат с инжекцией всех уровней памяти ---
     result: list = []
+
+    # Уровень 1: долговременные факты.
     facts = get_facts(conn, user_id)
     if facts:
-        # Факты первой строкой — компактный блок по категориям (build_memory_block
-        # в memory_compactor.py собирает текст; здесь — единый content). Синтетический
-        # row с role='memory', _build_messages превратит его в system-блок.
         from memory_compactor import build_memory_block
+        block = build_memory_block(facts)
+        if block:
+            result.append({
+                "role": "memory",
+                "kind": "memory",
+                "content": block,
+            })
+
+    # Уровень 2: дайджест предыдущей сессии (мягкий переход после паузы).
+    if session and session["prev_digest"]:
         result.append({
-            "role": "memory",
-            "kind": "memory",
-            "content": build_memory_block(facts),
+            "role": "session_prev",
+            "kind": "session",
+            "content": session["prev_digest"],
         })
-    result.extend(rows[kept_start:])
+
+    # Уровень 3: дайджест текущей сессии (тема + суть + открытые вопросы).
+    if session:
+        parts: list[str] = []
+        if session["topic"]:
+            parts.append(f"Тема: {session['topic']}")
+        if session["digest"]:
+            parts.append(session["digest"])
+        if session["unresolved"]:
+            parts.append(f"Открытые вопросы: {session['unresolved']}")
+        session_block = "\n".join(parts)
+        if session_block.strip():
+            result.append({
+                "role": "session_current",
+                "kind": "session",
+                "content": session_block,
+            })
+
+    # Дословный хвост.
+    result.extend(trimmed)
     return result
 
 
@@ -422,3 +499,114 @@ def drop_facts(conn: sqlite3.Connection, fact_ids: list[int]) -> None:
         tuple(fact_ids),
     )
     conn.commit()
+
+
+# --- Дайджест сессии (промежуточный уровень трёхуровневой памяти) ---
+
+def get_session_state(conn: sqlite3.Connection, user_id: int) -> dict | None:
+    """Текущее состояние сессии юзера (digest, topic, unresolved, prev_digest…).
+    None — сессии ещё не было (новый юзер / до миграции)."""
+    cur = conn.execute(
+        "SELECT digest, topic, unresolved, digest_until, session_start, "
+        "prev_digest, updated_at FROM session_state WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "digest": row["digest"],
+        "topic": row["topic"],
+        "unresolved": row["unresolved"],
+        "digest_until": row["digest_until"],
+        "session_start": row["session_start"],
+        "prev_digest": row["prev_digest"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def upsert_session_state(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    digest: str,
+    topic: str,
+    unresolved: str,
+    digest_until: int,
+    session_start: int,
+    prev_digest: str | None = None,
+) -> None:
+    """Обновить или создать запись сессии.  prev_digest=None — не трогать."""
+    now = int(time.time())
+    existing = get_session_state(conn, user_id)
+    if existing is None:
+        conn.execute(
+            "INSERT INTO session_state "
+            "(user_id, digest, topic, unresolved, digest_until, session_start, prev_digest, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, digest, topic, unresolved, digest_until, session_start,
+             prev_digest or "", now),
+        )
+    else:
+        if prev_digest is None:
+            conn.execute(
+                "UPDATE session_state SET digest=?, topic=?, unresolved=?, "
+                "digest_until=?, session_start=?, updated_at=? WHERE user_id=?",
+                (digest, topic, unresolved, digest_until, session_start, now, user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE session_state SET digest=?, topic=?, unresolved=?, "
+                "digest_until=?, session_start=?, prev_digest=?, updated_at=? "
+                "WHERE user_id=?",
+                (digest, topic, unresolved, digest_until, session_start,
+                 prev_digest, now, user_id),
+            )
+    conn.commit()
+
+
+def finalize_session(conn: sqlite3.Connection, user_id: int) -> None:
+    """Завершить сессию: дайджест + тему + нерешённое переносим в prev_digest,
+    текущие поля обнуляем. Вызывается при обнаружении длинной паузы."""
+    state = get_session_state(conn, user_id)
+    if state is None or (not state["digest"] and not state["topic"]):
+        return
+    # Собираем prev_digest из текущей сессии.
+    parts: list[str] = []
+    if state["topic"]:
+        parts.append(f"Тема: {state['topic']}")
+    if state["digest"]:
+        parts.append(state["digest"])
+    if state["unresolved"]:
+        parts.append(f"Нерешённое: {state['unresolved']}")
+    prev = "; ".join(parts) if parts else ""
+    now = int(time.time())
+    conn.execute(
+        "UPDATE session_state SET digest='', topic='', unresolved='', "
+        "digest_until=0, session_start=0, prev_digest=?, updated_at=? "
+        "WHERE user_id=?",
+        (prev, now, user_id),
+    )
+    conn.commit()
+
+
+def last_user_msg_ts(conn: sqlite3.Connection, user_id: int) -> int | None:
+    """created_at последнего сообщения юзера (роль 'user'), или None."""
+    cur = conn.execute(
+        "SELECT created_at FROM messages WHERE user_id = ? AND role = 'user' "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    return int(row["created_at"]) if row else None
+
+
+def last_any_msg_ts(conn: sqlite3.Connection, user_id: int) -> int | None:
+    """created_at самого свежего сообщения юзера (любая роль), или None."""
+    cur = conn.execute(
+        "SELECT created_at FROM messages WHERE user_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    return int(row["created_at"]) if row else None

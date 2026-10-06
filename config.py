@@ -61,6 +61,11 @@ class Config:
     # compact_wake_min — период проверки фонового цикла (минуты).
     compact_keep_recent: int
     compact_wake_min: float
+    # Сессионная память (промежуточный слой трёхуровневой памяти):
+    # session_timeout_h — пауза (в часах), после которой сессия переходит в prev_digest;
+    # session_keep_recent — сколько последних сообщений сессии держать дословно.
+    session_timeout_h: float
+    session_keep_recent: int
     # Reasoning effort для NIM glm-5.3-flash: 'low' — без размышлений (проверено:
     # NIM уважает reasoning_effort, chat_template_kwargs игнорирует). Пусто — не шлём.
     reasoning_effort: str
@@ -228,6 +233,9 @@ def get_config() -> Config:
         # Автокомпакт памяти (COMPACT_KEEP_RECENT/COMPACT_WAKE_MIN в .env).
         compact_keep_recent=_get_int("COMPACT_KEEP_RECENT", 20),
         compact_wake_min=_get_float("COMPACT_WAKE_MIN", 5.0),
+        # Сессионная память (SESSION_TIMEOUT_H / SESSION_KEEP_RECENT в .env).
+        session_timeout_h=_get_float("SESSION_TIMEOUT_H", 3.5),
+        session_keep_recent=_get_int("SESSION_KEEP_RECENT", 10),
         # Reasoning effort (REASONING_EFFORT в .env): 'low' — без размышлений.
         reasoning_effort=(os.getenv("REASONING_EFFORT") or "").strip(),
         # Webhook (WEBHOOK_MODE=1 в .env): aiohttp-сервер вместо polling.

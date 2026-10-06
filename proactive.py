@@ -127,6 +127,21 @@ async def build_proactive_messages(
                     "на старые темы; в видимой истории их уже нет."
                 ),
             })
+        elif role == "session_prev":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "В прошлый раз (до перерыва) вы говорили вот о чём:\n" + content +
+                    "\nМожно вернуться к этой теме, если есть что добавить."
+                ),
+            })
+        elif role == "session_current":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Ранее в этом разговоре (сжатая сводка):\n" + content
+                ),
+            })
         elif role == "user":
             messages.append({"role": "user", "content": content})
         else:
